@@ -1,13 +1,14 @@
 package cage
 
 import (
-	"context"
 	"encoding/json"
-	"github.com/sylvinus/agent-vm/internal/managedproxy"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/sylvinus/agent-vm/internal/guestprofile"
+	"github.com/sylvinus/agent-vm/internal/managedproxy"
 )
 
 func TestProxyRevisionRevokesOldReportAtSameEndpoint(t *testing.T) {
@@ -68,6 +69,9 @@ func TestProxyRevisionControlUpdatesHostRunningRecord(t *testing.T) {
 	if err := os.MkdirAll(instance, 0700); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := guestprofile.Create(profile, guestprofile.Options{}); err != nil {
+		t.Fatal(err)
+	}
 	cfg := DefaultConfig()
 	cfg.ProxyRevision = "initial"
 	p, _ := managedproxy.Load(profile)
@@ -104,14 +108,18 @@ func TestProxyRevisionControlUpdatesHostRunningRecord(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	saveRevision := func(c Config) {
+		t.Helper()
+		p.Revision = c.ProxyRevision
+		if err := p.Save(profile); err != nil {
+			t.Fatal(err)
+		}
+		write(c)
+	}
 	next := cfg
 	next.ProxyRevision = "new-core"
-	p.Revision = next.ProxyRevision
-	if err := p.Save(profile); err != nil {
-		t.Fatal(err)
-	}
-	write(next)
-	status, err := client.SyncProxyRevision(context.Background())
+	saveRevision(next)
+	status, err := client.SyncProxyRevision(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,6 +131,56 @@ func TestProxyRevisionControlUpdatesHostRunningRecord(t *testing.T) {
 	}
 	if err = cfg.CheckRunning(state); err == nil {
 		t.Fatal("old configuration still matches running record")
+	}
+
+	oldReport := fixtureGrant(t, g)
+	recovered := next
+	recovered.ProxyRevision = "recovered-core"
+	saveRevision(recovered)
+	if _, err = client.Renew(t.Context(), oldReport.ID); err == nil {
+		t.Fatal("old generation renewed after the saved configuration changed")
+	}
+	status, err = client.BeginCheck(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Configuration != recovered.Fingerprint() || status.Mode != GateChecking || status.Report != nil {
+		t.Fatal("recheck did not synchronize the saved generation before collecting evidence")
+	}
+	if err = recovered.CheckRunning(state); err != nil {
+		t.Fatal("recheck did not update the running record", err)
+	}
+	if _, err = client.Grant(t.Context(), oldReport); err == nil {
+		t.Fatal("old report opened the recovered generation")
+	}
+
+	changed := recovered
+	changed.Timezone = "Europe/London"
+	saveRevision(changed)
+	if _, err = client.BeginCheck(t.Context()); err == nil {
+		t.Fatal("a real time zone change was accepted without restarting")
+	}
+	if status = g.Status(); status.Mode != GateClosed || status.Configuration != recovered.Fingerprint() {
+		t.Fatal("the gate did not stay closed on the running configuration")
+	}
+
+	changed = recovered
+	changed.ProxyRevision = "changed-guest"
+	saveRevision(changed)
+	guest := *recovered.GuestProfile
+	guest.Hostname = "changed-host"
+	data, err := json.Marshal(guest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(filepath.Join(profile, guestprofile.Filename), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = client.BeginCheck(t.Context()); err == nil {
+		t.Fatal("a real guest profile change was accepted without restarting")
+	}
+	if status = g.Status(); status.Mode != GateClosed || status.Configuration != recovered.Fingerprint() {
+		t.Fatal("the gate did not stay closed on the running guest profile")
 	}
 }
 

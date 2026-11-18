@@ -22,6 +22,7 @@ import (
 )
 
 const gateRecordName = "cage-gate.json"
+const gateConfigMismatch = "配置已变更或无法读取，请重启环境并重新检测"
 
 type gateRecord struct {
 	Socket string `json:"socket"`
@@ -93,6 +94,15 @@ func StartGateControl(configPath, instanceDir string, gate *EgressGate) (func(),
 		return nil, err
 	}
 	server := &http.Server{ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second, IdleTimeout: 5 * time.Second, MaxHeaderBytes: 8192}
+	loadAppliedConfig := func() (Config, error) {
+		cfg, err := Load(configPath)
+		if err == nil {
+			err = cfg.RequireManagedProxy(filepath.Dir(configPath))
+		}
+		return cfg, err
+	}
+	// A watchdog read from before synchronization must not revoke a new check.
+	var controlMu sync.Mutex
 	server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Content-Type", "application/json")
@@ -118,31 +128,39 @@ func StartGateControl(configPath, instanceDir string, gate *EgressGate) (func(),
 				// Keep the wire/storage limit without splitting a UTF-8 character.
 				command.Reason = gateCloseReason(command.Reason)
 			}
-			if command.Action == "check" || command.Action == "grant" || command.Action == "renew" || command.Action == "proxy-revision" {
-				cfg, e := Load(configPath)
-				if e == nil {
-					e = cfg.RequireManagedProxy(filepath.Dir(configPath))
-				}
-				if e != nil {
+			controlMu.Lock()
+			defer controlMu.Unlock()
+			if r.Context().Err() != nil {
+				return
+			}
+			var cfg Config
+			switch command.Action {
+			case "check", "grant", "renew", "proxy-revision":
+				var err error
+				cfg, err = loadAppliedConfig()
+				if err != nil {
 					gate.Close("代理节点未应用，外网保持关闭")
 					w.WriteHeader(409)
-					_ = json.NewEncoder(w).Encode(map[string]string{"error": e.Error()})
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 					return
 				}
 			}
+			if (command.Action == "grant" || command.Action == "renew") && cfg.Fingerprint() != gate.Status().Configuration {
+				gate.Close(gateConfigMismatch)
+				w.WriteHeader(409)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": gateConfigMismatch})
+				return
+			}
 			switch command.Action {
 			case "proxy-revision":
-				cfg, e := Load(configPath)
-				if e != nil {
-					operationError = e
-				} else {
-					operationError = gate.SyncProxyRevision(cfg)
-					if operationError == nil {
-						operationError = cfg.RecordRunningAt(instanceDir)
-					}
-				}
+				operationError = gate.syncProxyRevision(cfg, instanceDir)
 			case "check":
-				operationError = gate.BeginCheck()
+				if cfg.Fingerprint() != gate.Status().Configuration {
+					operationError = gate.syncProxyRevision(cfg, instanceDir)
+				}
+				if operationError == nil {
+					operationError = gate.BeginCheck()
+				}
 			case "fault":
 				operationError = gate.SetFault(command.Fault)
 			case "grant":
@@ -158,6 +176,9 @@ func StartGateControl(configPath, instanceDir string, gate *EgressGate) (func(),
 			default:
 				w.WriteHeader(400)
 				return
+			}
+			if operationError != nil && (command.Action == "check" || command.Action == "proxy-revision") {
+				gate.Close(gateConfigMismatch)
 			}
 		} else if r.Method != "GET" || r.URL.Path != "/status" {
 			w.WriteHeader(404)
@@ -184,13 +205,12 @@ func StartGateControl(configPath, instanceDir string, gate *EgressGate) (func(),
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				cfg, err := Load(configPath)
-				if err == nil {
-					err = cfg.RequireManagedProxy(filepath.Dir(configPath))
-				}
+				controlMu.Lock()
+				cfg, err := loadAppliedConfig()
 				if err != nil || cfg.Fingerprint() != gate.Status().Configuration {
-					gate.Close("配置已变更或无法读取，请重启环境并重新检测")
+					gate.Close(gateConfigMismatch)
 				}
+				controlMu.Unlock()
 			}
 		}
 	}()

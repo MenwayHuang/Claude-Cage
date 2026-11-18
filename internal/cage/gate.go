@@ -107,11 +107,19 @@ func NewEgressGate(cfg Config) (*EgressGate, error) {
 // guest settings stay identical. Completing a previously empty anchor is also
 // allowed; both changes revoke authorization and require a fresh safety report.
 func (g *EgressGate) SyncProxyRevision(cfg Config) error {
+	return g.syncProxyRevision(cfg, "")
+}
+
+func (g *EgressGate) syncProxyRevision(cfg Config, instanceDir string) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
 	g.mu.Lock()
 	before, after := g.config, cfg
+	// Loading the same guest profile twice allocates two distinct objects.
+	sameGuest := before.GuestProfile == after.GuestProfile ||
+		(before.GuestProfile != nil && after.GuestProfile != nil && *before.GuestProfile == *after.GuestProfile)
+	before.GuestProfile, after.GuestProfile = nil, nil
 	oldPolicy, newPolicy := before.ExitPolicy.Normalized(), after.ExitPolicy.Normalized()
 	initialBinding := oldPolicy.NeedsBinding() && !newPolicy.NeedsBinding() &&
 		oldPolicy.Mode == newPolicy.Mode && oldPolicy.Scope == newPolicy.Scope &&
@@ -123,9 +131,15 @@ func (g *EgressGate) SyncProxyRevision(cfg Config) error {
 		before.ExitPolicy, after.ExitPolicy = ExitPolicy{}, ExitPolicy{}
 	}
 	before.ProxyRevision, after.ProxyRevision = "", ""
-	if before != after || cfg.ProxyRevision == "" {
+	if !sameGuest || before != after || cfg.ProxyRevision == "" {
 		g.mu.Unlock()
 		return errors.New("出口地址或环境设置变化需要重启环境")
+	}
+	if instanceDir != "" {
+		if err := cfg.RecordRunningAt(instanceDir); err != nil {
+			g.mu.Unlock()
+			return err
+		}
 	}
 	connections := g.transitionLocked(GateClosed, false, "代理节点已变更，等待重新检查")
 	g.config = cfg
